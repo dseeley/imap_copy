@@ -15,6 +15,8 @@ import imaplib
 import logging
 import argparse
 import email
+import os
+import re
 
 
 class IMAP_Copy(object):
@@ -90,86 +92,90 @@ class IMAP_Copy(object):
         self._disconnect('source')
         self._disconnect('destination')
 
-    def copy(self, source_mailbox, destination_mailbox, skip, limit, recurse_level=0):
+    def copy(self, source_mailbox, destination_mailbox_prefix, skip, limit):
+        source_mailboxes = [source_mailbox]
         if self.recurse:
+            source_mailboxes = []
             self.logger.info("Getting list of mailboxes under %s" % source_mailbox)
             connection = self._conn_source
             typ, data = connection.list(source_mailbox)
             for d in data:
-                if d:
-                    new_source_mailbox = d.split('"')[3]  # Getting submailbox name
-                    if new_source_mailbox.count('/') == recurse_level:
-                        self.logger.info("Recursing into %s" % new_source_mailbox)
-                        new_destination_mailbox = new_source_mailbox.split("/")[recurse_level]
-                        self.copy(new_source_mailbox, destination_mailbox + self.delimiter + new_destination_mailbox,
-                                  skip, limit, recurse_level + 1)
+                source_mailboxes.append(d.split("\"/\"")[1].strip())
 
         # There should be no files stored in / so we are bailing out
-        if source_mailbox == '':
+        if len(source_mailbox) == 0:
+            self.logger.info("No source mailboxes")
             return
 
-        # Connect to source and open mailbox
-        status, data = self._conn_source.select(source_mailbox, True)
-        if status != "OK":
-            self.logger.error("Couldn't open source mailbox %s" %
-                              source_mailbox)
-            sys.exit(2)
-
-        # Connect to destination and open or create mailbox
-        status, data = self._conn_destination.select(destination_mailbox)
-        if status != "OK" and not self.create_mailboxes:
-            self.logger.error("Couldn't open destination mailbox %s" %
-                              destination_mailbox)
-            sys.exit(2)
-        else:
-            self.logger.info("Create destination mailbox %s" %
-                             destination_mailbox)
-            self._conn_destination.create(destination_mailbox)
-            self._conn_destination.subscribe(destination_mailbox)
-            status, data = self._conn_destination.select(destination_mailbox)
-
-        # Look for mails
-        self.logger.info("Looking for mails in %s" % source_mailbox)
-        status, data = self._conn_source.search(None, 'ALL')
-        data = data[0].split()
-        mail_count = len(data)
-
-        self.logger.info("Start copy %s => %s (%d mails)" % (
-            source_mailbox, destination_mailbox, mail_count))
-
-        progress_count = 0
-        copy_count = 0
-
-        for msg_num in data:
-            progress_count += 1
-            if progress_count <= skip:
-                self.logger.info("Skipping mail %d of %d" % (
-                    progress_count, mail_count))
-                continue
+        for source_mailbox in source_mailboxes:
+            if len(destination_mailbox_prefix):
+                destination_mailbox = destination_mailbox_prefix + "/" + source_mailbox
             else:
-                status, data = self._conn_source.fetch(msg_num, '(RFC822 FLAGS)')
-                message = data[0][1]
-                flags = data[1][8:][:-2]  # Not perfect.. Waiting for bug reports
-                msg = email.message_from_string(message);
-                msgDate = email.utils.parsedate(msg['Date'])
+                destination_mailbox = source_mailbox
+            # Connect to source and open mailbox
+            status, data = self._conn_source.select(source_mailbox, True)
+            if status != "OK":
+                self.logger.error("Couldn't open source mailbox %s" % source_mailbox)
+                sys.exit(2)
 
-                self._conn_destination.append(
-                    destination_mailbox, flags, msgDate, message
-                )
+            # Connect to destination and open or create mailbox
+            if len(destination_mailbox_prefix):
+                status, data = self._conn_destination.select(destination_mailbox_prefix)
+            else:
+                status, data = self._conn_destination.select()
 
-                copy_count += 1
-                message_md5 = hashlib.md5(message).hexdigest()
+            if status != "OK" and not self.create_mailboxes:
+                self.logger.error("Couldn't open destination mailbox %s" % destination_mailbox_prefix)
+                sys.exit(2)
+            else:
+                self.logger.info("Create destination mailbox %s" % destination_mailbox)
+                target = ""
+                for level in destination_mailbox.split('/'):
+                    target += level
+                    self._conn_destination.create(target)
+                    target += '/'
+                self._conn_destination.subscribe(destination_mailbox)
+                status, data = self._conn_destination.select(destination_mailbox)
 
-                self.logger.info("Copy mail %d of %d (copy_count=%d, md5(message)=%s)" % (
-                    progress_count, mail_count, copy_count, message_md5))
+            # Look for mails
+            self.logger.info("Looking for mails in %s" % source_mailbox)
+            status, data = self._conn_source.search(None, 'ALL')
+            data = data[0].split()
+            mail_count = len(data)
 
-                if limit > 0 and copy_count >= limit:
-                    self.logger.info("Copy limit %d reached (copy_count=%d)" % (
-                        limit, copy_count))
-                    break
+            self.logger.info("Start copy %s => %s (%d mails)" % (source_mailbox, destination_mailbox, mail_count))
 
-        self.logger.info("Copy complete %s => %s (%d out of %d mails copied)" % (
-            source_mailbox, destination_mailbox, copy_count, mail_count))
+            progress_count = 0
+            copy_count = 0
+
+            for msg_num in data:
+                progress_count += 1
+                if progress_count <= skip:
+                    self.logger.info("Skipping mail %d of %d" % (
+                        progress_count, mail_count))
+                    continue
+                else:
+                    status, data = self._conn_source.fetch(msg_num, '(RFC822 FLAGS)')
+                    message = data[0][1]
+                    flags = re.sub('.*?FLAGS \((.*?)\).*', r'\1', data[0][0])
+                    msg = email.message_from_string(message)
+                    msgDate = email.utils.parsedate(msg['Date'])
+
+                    self._conn_destination.append(destination_mailbox, flags, msgDate, message)
+
+                    copy_count += 1
+                    message_md5 = ""  # hashlib.md5(message).hexdigest()
+
+                    self.logger.info("Copy mail %d of %d (copy_count=%d, md5(message)=%s)" % (
+                        progress_count, mail_count, copy_count, message_md5))
+
+                    if limit > 0 and copy_count >= limit:
+                        self.logger.info("Copy limit %d reached (copy_count=%d)" % (
+                            limit, copy_count))
+                        break
+
+            self.logger.info("Copy complete %s => %s (%d out of %d mails copied)" % (
+                source_mailbox, destination_mailbox_prefix, copy_count, mail_count))
 
     def run(self):
         try:
